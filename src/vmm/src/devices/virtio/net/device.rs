@@ -26,7 +26,7 @@ use crate::devices::virtio::gen::virtio_net::{
     VIRTIO_NET_F_HOST_TSO6, VIRTIO_NET_F_HOST_UFO, VIRTIO_NET_F_MAC,
 };
 use crate::devices::virtio::gen::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use crate::devices::virtio::iovec::IoVecBuffer;
+use crate::devices::virtio::iovec::{IoVecBackBuffer, IoVecBuffer};
 use crate::devices::virtio::net::metrics::{NetDeviceMetrics, NetMetricsPerDevice};
 use crate::devices::virtio::net::tap::Tap;
 use crate::devices::virtio::net::{
@@ -130,6 +130,8 @@ pub struct Net {
 
     tx_frame_headers: [u8; frame_hdr_len()],
 
+    tx_iovec_buffer: IoVecBackBuffer,
+
     pub(crate) irq_trigger: IrqTrigger,
 
     pub(crate) config_space: ConfigSpace,
@@ -192,6 +194,7 @@ impl Net {
             rx_bytes_read: 0,
             rx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             tx_frame_headers: [0u8; frame_hdr_len()],
+            tx_iovec_buffer: IoVecBackBuffer::new(),
             irq_trigger: IrqTrigger::new().map_err(NetError::EventFd)?,
             config_space,
             guest_mac,
@@ -597,7 +600,7 @@ impl Net {
                 .add(tx_queue.len(mem).into());
             let head_index = head.index;
             // Parse IoVecBuffer from descriptor head
-            let buffer = match IoVecBuffer::from_descriptor_chain(head) {
+            let buffer = match IoVecBuffer::from_descriptor_chain(head, &mut self.tx_iovec_buffer) {
                 Ok(buffer) => buffer,
                 Err(_) => {
                     self.metrics.tx_fails.inc();

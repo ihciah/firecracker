@@ -21,7 +21,7 @@ use vm_memory::volatile_memory::Error;
 use vm_memory::{GuestMemoryError, ReadVolatile, WriteVolatile};
 
 use super::{defs, VsockError};
-use crate::devices::virtio::iovec::{IoVecBuffer, IoVecBufferMut};
+use crate::devices::virtio::iovec::{IoVecBackBuffer, IoVecBuffer, IoVecBufferMut};
 use crate::devices::virtio::queue::DescriptorChain;
 use crate::vstate::memory::ByteValued;
 
@@ -88,11 +88,11 @@ unsafe impl ByteValued for VsockPacketHeader {}
 /// Read and write permissions are statically enforced by using the correct `IoVecBuffer[Mut]`
 /// abstraction
 #[derive(Debug)]
-pub enum VsockPacketBuffer {
+pub enum VsockPacketBuffer<'a> {
     /// Buffer holds a read-only guest-to-host (TX) packet
-    Tx(IoVecBuffer),
+    Tx(IoVecBuffer<'a>),
     /// Buffer holds a write-only host-to-guest (RX) packet
-    Rx(IoVecBufferMut),
+    Rx(IoVecBufferMut<'a>),
 }
 
 /// Struct describing a single vsock packet.
@@ -100,17 +100,17 @@ pub enum VsockPacketBuffer {
 /// Encapsulates the virtio descriptor chain containing the packet through the `IoVecBuffer[Mut]`
 /// abstractions.
 #[derive(Debug)]
-pub struct VsockPacket {
+pub struct VsockPacket<'a> {
     /// A copy of the vsock packet's 44-byte header, held in hypervisor memory
     /// to minimize the number of accesses to guest memory. Can be written back
     /// to geust memory using [`VsockPacket::commit_hdr`] (only for RX buffers).
     hdr: VsockPacketHeader,
     /// The raw buffer, as it is contained in guest memory (containing both
     /// header and payload)
-    buffer: VsockPacketBuffer,
+    buffer: VsockPacketBuffer<'a>,
 }
 
-impl VsockPacket {
+impl<'a> VsockPacket<'a> {
     /// Create the packet wrapper from a TX virtq chain head.
     ///
     /// ## Errors
@@ -123,8 +123,8 @@ impl VsockPacket {
     ///   length would exceed [`defs::MAX_PKT_BUR_SIZE`].
     /// - [`VsockError::DescChainTooShortForPacket`] if the contained vsock header describes a vsock
     ///   packet whose length exceeds the descriptor chain's actual total buffer length.
-    pub fn from_tx_virtq_head(chain: DescriptorChain) -> Result<Self, VsockError> {
-        let buffer = IoVecBuffer::from_descriptor_chain(chain)?;
+    pub fn from_tx_virtq_head(chain: DescriptorChain, buf: &'a mut IoVecBackBuffer) -> Result<Self, VsockError> {
+        let buffer = IoVecBuffer::from_descriptor_chain(chain, buf)?;
 
         let mut hdr = VsockPacketHeader::default();
         match buffer.read_exact_volatile_at(hdr.as_mut_slice(), 0) {
@@ -157,8 +157,8 @@ impl VsockPacket {
     /// ## Errors
     /// Returns [`VsockError::DescChainTooShortForHeader`] if the descriptor chain's total buffer
     /// length is insufficient to hold the 44 byte vsock header
-    pub fn from_rx_virtq_head(chain: DescriptorChain) -> Result<Self, VsockError> {
-        let buffer = IoVecBufferMut::from_descriptor_chain(chain)?;
+    pub fn from_rx_virtq_head(chain: DescriptorChain, buf: &'a mut IoVecBackBuffer) -> Result<Self, VsockError> {
+        let buffer = IoVecBufferMut::from_descriptor_chain_buf(chain, buf)?;
 
         if buffer.len() < VSOCK_PKT_HDR_SIZE {
             return Err(VsockError::DescChainTooShortForHeader(buffer.len() as usize));
@@ -388,10 +388,12 @@ mod tests {
             expect_asm_error!($test_ctx, $handler_ctx, $err, from_rx_virtq_head, RXQ_INDEX);
         };
         ($test_ctx:expr, $handler_ctx:expr, $err:pat, $ctor:ident, $vq_index:ident) => {
+            let mut iovec_buffer = IoVecBackBuffer::new();
             let result = VsockPacket::$ctor(
                 $handler_ctx.device.queues[$vq_index]
                     .pop(&$test_ctx.mem)
                     .unwrap(),
+                &mut iovec_buffer,
             );
             assert!(matches!(result, Err($err)), "{:?}", result)
         };
@@ -418,11 +420,12 @@ mod tests {
         // Test case: successful TX packet assembly as linux < 6.1 would build them.
         {
             create_context!(test_ctx, handler_ctx);
-
+            let mut iovec_buffer = IoVecBackBuffer::new();
             let pkt = VsockPacket::from_tx_virtq_head(
                 handler_ctx.device.queues[TXQ_INDEX]
                     .pop(&test_ctx.mem)
                     .unwrap(),
+                    &mut iovec_buffer,
             )
             .unwrap();
 
@@ -459,11 +462,13 @@ mod tests {
         // Test case: zero-length TX packet.
         {
             create_context!(test_ctx, handler_ctx);
+            let mut iovec_buffer = IoVecBackBuffer::new();
             set_pkt_len(0, &handler_ctx.guest_txvq.dtable[0], &test_ctx.mem);
             VsockPacket::from_tx_virtq_head(
                 handler_ctx.device.queues[TXQ_INDEX]
                     .pop(&test_ctx.mem)
                     .unwrap(),
+                    &mut iovec_buffer,
             )
             .unwrap();
         }
@@ -523,10 +528,12 @@ mod tests {
         // Test case: successful RX packet assembly.
         {
             create_context!(test_ctx, handler_ctx);
+            let mut iovec_buffer = IoVecBackBuffer::new();
             let pkt = VsockPacket::from_rx_virtq_head(
                 handler_ctx.device.queues[RXQ_INDEX]
                     .pop(&test_ctx.mem)
                     .unwrap(),
+                    &mut iovec_buffer,
             )
             .unwrap();
             assert_eq!(
@@ -573,10 +580,12 @@ mod tests {
         const FWD_CNT: u32 = 10;
 
         create_context!(test_ctx, handler_ctx);
+        let mut iovec_buffer = IoVecBackBuffer::new();
         let mut pkt = VsockPacket::from_rx_virtq_head(
             handler_ctx.device.queues[RXQ_INDEX]
                 .pop(&test_ctx.mem)
                 .unwrap(),
+                &mut iovec_buffer,
         )
         .unwrap();
 
@@ -624,6 +633,7 @@ mod tests {
     #[test]
     fn test_packet_buf() {
         create_context!(test_ctx, handler_ctx);
+        let mut iovec_buffer = IoVecBackBuffer::new();
         // create_context gives us an rx descriptor chain and a tx descriptor chain pointing to the
         // same area of memory. We need both a rx-view and a tx-view into the packet, as tx-queue
         // buffers are read only, while rx queue buffers are write-only
@@ -631,12 +641,15 @@ mod tests {
             handler_ctx.device.queues[RXQ_INDEX]
                 .pop(&test_ctx.mem)
                 .unwrap(),
+                &mut iovec_buffer,
         )
         .unwrap();
+        let mut iovec_buffer2 = IoVecBackBuffer::new();
         let pkt2 = VsockPacket::from_tx_virtq_head(
             handler_ctx.device.queues[TXQ_INDEX]
                 .pop(&test_ctx.mem)
                 .unwrap(),
+                &mut iovec_buffer2,
         )
         .unwrap();
 

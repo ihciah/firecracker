@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io::ErrorKind;
+use std::ops::Deref;
 
 use libc::{c_void, iovec, size_t};
 use smallvec::SmallVec;
@@ -38,17 +39,17 @@ type IoVecVec = SmallVec<[iovec; 4]>;
 /// memory regions. Additionally, this wrapper provides methods that allow reading arbitrary ranges
 /// of data from that buffer.
 #[derive(Debug)]
-pub struct IoVecBuffer {
+pub struct IoVecBuffer<'a> {
     // container of the memory regions included in this IO vector
-    vecs: IoVecVec,
+    vecs: IoVecBufferBorrowed<'a>,
     // Total length of the IoVecBuffer
     len: u32,
 }
 
-impl IoVecBuffer {
-    /// Create an `IoVecBuffer` from a `DescriptorChain`
-    pub fn from_descriptor_chain(head: DescriptorChain) -> Result<Self, IoVecError> {
-        let mut vecs = IoVecVec::new();
+impl<'a> IoVecBuffer<'a> {
+    /// Create an `IoVecBuffer` from a `DescriptorChain` and a given buffer.
+    pub fn from_descriptor_chain(head: DescriptorChain, buf: &'a mut IoVecBackBuffer) -> Result<Self, IoVecError> {
+        let mut vecs = buf.borrow();
         let mut len = 0u32;
 
         let mut next_descriptor = Some(head);
@@ -139,7 +140,7 @@ impl IoVecBuffer {
     ) -> Result<usize, VolatileMemoryError> {
         let mut total_bytes_read = 0;
 
-        for iov in &self.vecs {
+        for iov in self.vecs.deref() {
             if len == 0 {
                 break;
             }
@@ -188,17 +189,17 @@ impl IoVecBuffer {
 /// memory regions. Additionally, this wrapper provides methods that allow reading arbitrary ranges
 /// of data from that buffer.
 #[derive(Debug)]
-pub struct IoVecBufferMut {
+pub struct IoVecBufferMut<'a> {
     // container of the memory regions included in this IO vector
-    vecs: IoVecVec,
+    vecs: IoVecBufferBorrowed<'a>,
     // Total length of the IoVecBufferMut
     len: u32,
 }
 
-impl IoVecBufferMut {
-    /// Create an `IoVecBufferMut` from a `DescriptorChain`
-    pub fn from_descriptor_chain(head: DescriptorChain) -> Result<Self, IoVecError> {
-        let mut vecs = IoVecVec::new();
+impl<'a> IoVecBufferMut<'a> {
+    /// Create an `IoVecBufferMut` from a `DescriptorChain` and a given buffer.
+    pub fn from_descriptor_chain_buf(head: DescriptorChain, buf: &'a mut IoVecBackBuffer) -> Result<Self, IoVecError> {
+        let mut vecs = buf.borrow();
         let mut len = 0u32;
 
         for desc in head {
@@ -279,7 +280,7 @@ impl IoVecBufferMut {
     ) -> Result<usize, VolatileMemoryError> {
         let mut total_bytes_read = 0;
 
-        for iov in &self.vecs {
+        for iov in self.vecs.deref() {
             if len == 0 {
                 break;
             }
@@ -322,6 +323,45 @@ impl IoVecBufferMut {
     }
 }
 
+#[derive(Default, Clone, Debug)]
+pub struct IoVecBackBuffer(Vec<libc::iovec>);
+
+unsafe impl Send for IoVecBackBuffer {}
+unsafe impl Sync for IoVecBackBuffer {}
+
+impl IoVecBackBuffer {
+    pub const fn new() -> Self {
+        IoVecBackBuffer(Vec::new())
+    }
+
+    pub fn borrow(&mut self) -> IoVecBufferBorrowed<'_> {
+        IoVecBufferBorrowed(&mut self.0)
+    }
+}
+
+#[derive(Debug)]
+pub struct IoVecBufferBorrowed<'a>(&'a mut Vec<libc::iovec>);
+
+impl<'a> std::ops::Deref for IoVecBufferBorrowed<'a> {
+    type Target = Vec<libc::iovec>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+impl<'a> std::ops::DerefMut for IoVecBufferBorrowed<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
+    }
+}
+
+impl Drop for IoVecBufferBorrowed<'_> {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use libc::{c_void, iovec};
@@ -333,7 +373,7 @@ mod tests {
     use crate::utilities::test_utils::multi_region_mem;
     use crate::vstate::memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
-    impl<'a> From<&'a [u8]> for IoVecBuffer {
+    impl<'a> From<&'a [u8]> for IoVecBuffer<'a> {
         fn from(buf: &'a [u8]) -> Self {
             Self {
                 vecs: vec![iovec {
@@ -426,50 +466,54 @@ mod tests {
     #[test]
     fn test_access_mode() {
         let mem = default_mem();
+        let mut iovec_buffer = IoVecBackBuffer::new();
         let (mut q, _) = read_only_chain(&mem);
         let head = q.pop(&mem).unwrap();
-        IoVecBuffer::from_descriptor_chain(head).unwrap();
+        IoVecBuffer::from_descriptor_chain(head, &mut iovec_buffer).unwrap();
 
         let (mut q, _) = write_only_chain(&mem);
         let head = q.pop(&mem).unwrap();
-        IoVecBuffer::from_descriptor_chain(head).unwrap_err();
+        IoVecBuffer::from_descriptor_chain(head, &mut iovec_buffer).unwrap_err();
 
         let (mut q, _) = read_only_chain(&mem);
         let head = q.pop(&mem).unwrap();
-        IoVecBufferMut::from_descriptor_chain(head).unwrap_err();
+        IoVecBufferMut::from_descriptor_chain(head, &mut iovec_buffer).unwrap_err();
 
         let (mut q, _) = write_only_chain(&mem);
         let head = q.pop(&mem).unwrap();
-        IoVecBufferMut::from_descriptor_chain(head).unwrap();
+        IoVecBufferMut::from_descriptor_chain(head, &mut iovec_buffer).unwrap();
     }
 
     #[test]
     fn test_iovec_length() {
         let mem = default_mem();
+        let mut iovec_buffer = IoVecBackBuffer::new();
         let (mut q, _) = read_only_chain(&mem);
         let head = q.pop(&mem).unwrap();
 
-        let iovec = IoVecBuffer::from_descriptor_chain(head).unwrap();
+        let iovec = IoVecBuffer::from_descriptor_chain(head, &mut iovec_buffer).unwrap();
         assert_eq!(iovec.len(), 4 * 64);
     }
 
     #[test]
     fn test_iovec_mut_length() {
         let mem = default_mem();
+        let mut iovec_buffer = IoVecBackBuffer::new();
         let (mut q, _) = write_only_chain(&mem);
         let head = q.pop(&mem).unwrap();
 
-        let iovec = IoVecBufferMut::from_descriptor_chain(head).unwrap();
+        let iovec = IoVecBufferMut::from_descriptor_chain(head, &mut iovec_buffer).unwrap();
         assert_eq!(iovec.len(), 4 * 64);
     }
 
     #[test]
     fn test_iovec_read_at() {
         let mem = default_mem();
+        let mut iovec_buffer = IoVecBackBuffer::new();
         let (mut q, _) = read_only_chain(&mem);
         let head = q.pop(&mem).unwrap();
 
-        let iovec = IoVecBuffer::from_descriptor_chain(head).unwrap();
+        let iovec = IoVecBuffer::from_descriptor_chain(head, &mut iovec_buffer).unwrap();
 
         let mut buf = vec![0u8; 257];
         assert_eq!(
@@ -518,12 +562,13 @@ mod tests {
     #[test]
     fn test_iovec_mut_write_at() {
         let mem = default_mem();
+        let mut iovec_buffer = IoVecBackBuffer::new();
         let (mut q, vq) = write_only_chain(&mem);
 
         // This is a descriptor chain with 4 elements 64 bytes long each.
         let head = q.pop(&mem).unwrap();
 
-        let mut iovec = IoVecBufferMut::from_descriptor_chain(head).unwrap();
+        let mut iovec = IoVecBufferMut::from_descriptor_chain(head, &mut iovec_buffer).unwrap();
         let buf = vec![0u8, 1, 2, 3, 4];
 
         // One test vector for each part of the chain

@@ -174,10 +174,10 @@ pub trait VsockEpollListener: AsRawFd {
 ///       - `send_pkt(&pkt)` will fetch data from `pkt`, and place it into the channel.
 pub trait VsockChannel {
     /// Read/receive an incoming packet from the channel.
-    fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> Result<(), VsockError>;
+    fn recv_pkt<'a>(&mut self, pkt: &mut VsockPacket<'a>) -> Result<(), VsockError>;
 
     /// Write/send a packet through the channel.
-    fn send_pkt(&mut self, pkt: &VsockPacket) -> Result<(), VsockError>;
+    fn send_pkt<'a>(&mut self, pkt: &VsockPacket<'a>) -> Result<(), VsockError>;
 
     /// Checks whether there is pending incoming data inside the channel, meaning that a subsequent
     /// call to `recv_pkt()` won't fail.

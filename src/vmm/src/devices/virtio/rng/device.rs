@@ -13,7 +13,7 @@ use super::metrics::METRICS;
 use super::{RNG_NUM_QUEUES, RNG_QUEUE};
 use crate::devices::virtio::device::{DeviceState, IrqTrigger, IrqType, VirtioDevice};
 use crate::devices::virtio::gen::virtio_rng::VIRTIO_F_VERSION_1;
-use crate::devices::virtio::iovec::IoVecBufferMut;
+use crate::devices::virtio::iovec::{IoVecBackBuffer, IoVecBufferMut};
 use crate::devices::virtio::queue::{Queue, FIRECRACKER_MAX_QUEUE_SIZE};
 use crate::devices::virtio::{ActivateError, TYPE_RNG};
 use crate::devices::DeviceError;
@@ -48,6 +48,8 @@ pub struct Entropy {
 
     // Device specific fields
     rate_limiter: RateLimiter,
+
+    iovec_buf: IoVecBackBuffer,
 }
 
 impl Entropy {
@@ -75,6 +77,7 @@ impl Entropy {
             queue_events,
             irq_trigger,
             rate_limiter,
+            iovec_buf: IoVecBackBuffer::new(),
         })
     }
 
@@ -106,7 +109,7 @@ impl Entropy {
         rate_limiter.manual_replenish(bytes, TokenType::Bytes);
     }
 
-    fn handle_one(&self, iovec: &mut IoVecBufferMut) -> Result<u32, EntropyError> {
+    fn handle_one(iovec: &mut IoVecBufferMut) -> Result<u32, EntropyError> {
         // If guest provided us with an empty buffer just return directly
         if iovec.len() == 0 {
             return Ok(0);
@@ -132,7 +135,7 @@ impl Entropy {
             let index = desc.index;
             METRICS.entropy_event_count.inc();
 
-            let bytes = match IoVecBufferMut::from_descriptor_chain(desc) {
+            let bytes = match IoVecBufferMut::from_descriptor_chain_buf(desc, &mut self.iovec_buf) {
                 Ok(mut iovec) => {
                     debug!(
                         "entropy: guest request for {} bytes of entropy",
@@ -149,7 +152,7 @@ impl Entropy {
                         break;
                     }
 
-                    self.handle_one(&mut iovec).unwrap_or_else(|err| {
+                    Self::handle_one(&mut iovec).unwrap_or_else(|err| {
                         error!("entropy: {err}");
                         METRICS.entropy_event_fails.inc();
                         0

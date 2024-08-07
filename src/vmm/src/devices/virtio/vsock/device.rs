@@ -31,6 +31,7 @@ use super::defs::uapi;
 use super::packet::{VsockPacket, VSOCK_PKT_HDR_SIZE};
 use super::{defs, VsockBackend};
 use crate::devices::virtio::device::{DeviceState, IrqTrigger, IrqType, VirtioDevice};
+use crate::devices::virtio::iovec::IoVecBackBuffer;
 use crate::devices::virtio::queue::Queue as VirtQueue;
 use crate::devices::virtio::vsock::metrics::METRICS;
 use crate::devices::virtio::vsock::VsockError;
@@ -68,6 +69,8 @@ pub struct Vsock<B> {
     // continuous triggers from happening before the device gets activated.
     pub(crate) activate_evt: EventFd,
     pub(crate) device_state: DeviceState,
+
+    iovec_buf: IoVecBackBuffer,
 }
 
 // TODO: Detect / handle queue deadlock:
@@ -101,6 +104,7 @@ where
             irq_trigger: IrqTrigger::new().map_err(VsockError::EventFd)?,
             activate_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(VsockError::EventFd)?,
             device_state: DeviceState::Inactive,
+            iovec_buf: IoVecBackBuffer::new(),
         })
     }
 
@@ -147,7 +151,7 @@ where
 
         while let Some(head) = self.queues[RXQ_INDEX].pop(mem) {
             let index = head.index;
-            let used_len = match VsockPacket::from_rx_virtq_head(head) {
+            let used_len = match VsockPacket::from_rx_virtq_head(head, &mut self.iovec_buf) {
                 Ok(mut pkt) => {
                     if self.backend.recv_pkt(&mut pkt).is_ok() {
                         match pkt.commit_hdr() {
@@ -200,7 +204,7 @@ where
 
         while let Some(head) = self.queues[TXQ_INDEX].pop(mem) {
             let index = head.index;
-            let pkt = match VsockPacket::from_tx_virtq_head(head) {
+            let pkt = match VsockPacket::from_tx_virtq_head(head, &mut self.iovec_buf) {
                 Ok(pkt) => pkt,
                 Err(err) => {
                     error!("vsock: error reading TX packet: {:?}", err);

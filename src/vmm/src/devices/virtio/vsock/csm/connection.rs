@@ -160,7 +160,7 @@ where
     /// - `Err(VsockError::NoData)`: there was no data available with which to fill in the packet;
     /// - `Err(VsockError::PktBufMissing)`: the packet would've been filled in with data, but it is
     ///   missing the data buffer.
-    fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> Result<(), VsockError> {
+    fn recv_pkt<'a>(&mut self, pkt: &mut VsockPacket<'a>) -> Result<(), VsockError> {
         // Perform some generic initialization that is the same for any packet operation (e.g.
         // source, destination, credit, etc).
         self.init_pkt(pkt);
@@ -667,7 +667,7 @@ where
     }
 
     /// Prepare a packet header for transmission to our peer.
-    fn init_pkt<'a>(&self, pkt: &'a mut VsockPacket) -> &'a mut VsockPacket {
+    fn init_pkt<'a, 'b>(&self, pkt: &'a mut VsockPacket<'b>) -> &'a mut VsockPacket<'b> {
         pkt.set_src_cid(self.local_cid)
             .set_dst_cid(self.peer_cid)
             .set_src_port(self.local_port)
@@ -865,12 +865,14 @@ mod tests {
                 handler_ctx.device.queues[RXQ_INDEX]
                     .pop(&vsock_test_ctx.mem)
                     .unwrap(),
+                    &mut IoVecBackBuffer::new(),
             )
             .unwrap();
             let tx_pkt = VsockPacket::from_tx_virtq_head(
                 handler_ctx.device.queues[TXQ_INDEX]
                     .pop(&vsock_test_ctx.mem)
                     .unwrap(),
+                    &mut IoVecBackBuffer::new(),
             )
             .unwrap();
             let conn = match conn_state {
