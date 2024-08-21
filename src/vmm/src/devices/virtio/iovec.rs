@@ -24,13 +24,15 @@ pub enum IoVecError {
     GuestMemory(#[from] GuestMemoryError),
 }
 
+const SMALL_VEC_SIZE: usize = 4;
+
 // Using SmallVec in the kani proofs causes kani to use unbounded amounts of memory
 // during post-processing, and then crash.
 // TODO: remove new-type once kani performance regression are resolved
 #[cfg(kani)]
 type IoVecVec = Vec<iovec>;
 #[cfg(not(kani))]
-type IoVecVec = SmallVec<[iovec; 4]>;
+type IoVecVec = SmallVec<[iovec; SMALL_VEC_SIZE]>;
 
 /// This is essentially a wrapper of a `Vec<libc::iovec>` which can be passed to `libc::writev`.
 ///
@@ -45,6 +47,15 @@ pub struct IoVecBuffer {
     len: u32,
 }
 
+impl IoVecBuffer {
+    pub fn with_capacity(cap: usize) -> IoVecBuffer {
+        IoVecBuffer {
+            vecs: IoVecVec::with_capacity(cap),
+            len: 0,
+        }
+    }
+}
+
 // SAFETY: `IoVecBuffer` doesn't allow for interior mutability and no shared ownership is possible
 // as it doesn't implement clone
 unsafe impl Send for IoVecBuffer {}
@@ -57,12 +68,11 @@ impl IoVecBuffer {
     /// The descriptor chain cannot be referencing the same memory location as another chain
     pub unsafe fn load_descriptor_chain(
         &mut self,
-        head: DescriptorChain,
+        mut desc: DescriptorChain,
     ) -> Result<(), IoVecError> {
         self.clear();
 
-        let mut next_descriptor = Some(head);
-        while let Some(desc) = next_descriptor {
+        loop {
             if desc.is_write_only() {
                 return Err(IoVecError::WriteOnlyDescriptor);
             }
@@ -85,7 +95,9 @@ impl IoVecBuffer {
                 .checked_add(desc.len)
                 .ok_or(IoVecError::OverflowedDescriptor)?;
 
-            next_descriptor = desc.next_descriptor();
+            if desc.load_next_descriptor().is_none() {
+                break;
+            }
         }
 
         Ok(())
@@ -217,21 +229,38 @@ impl IoVecBuffer {
 /// It describes a write-only buffer passed to us by the guest that is scattered across multiple
 /// memory regions. Additionally, this wrapper provides methods that allow reading arbitrary ranges
 /// of data from that buffer.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct IoVecBufferMut {
     // container of the memory regions included in this IO vector
-    vecs: IoVecVec,
+    pub(crate) vecs: IoVecVec,
     // Total length of the IoVecBufferMut
-    len: u32,
+    pub(crate) len: u32,
 }
 
 impl IoVecBufferMut {
-    /// Create an `IoVecBufferMut` from a `DescriptorChain`
-    pub fn from_descriptor_chain(head: DescriptorChain) -> Result<Self, IoVecError> {
-        let mut vecs = IoVecVec::new();
-        let mut len = 0u32;
+    pub fn with_capacity(cap: usize) -> IoVecBufferMut {
+        IoVecBufferMut {
+            vecs: IoVecVec::with_capacity(cap),
+            len: 0,
+        }
+    }
+}
 
-        for desc in head {
+// SAFETY: iovec pointers are safe to send across threads.
+unsafe impl Send for IoVecBufferMut {}
+
+impl IoVecBufferMut {
+    /// Create an `IoVecBufferMut` from a `DescriptorChain`
+    /// # Safety
+    /// The descriptor chain cannot be referencing the same memory location as another chain.
+    pub unsafe fn load_descriptor_chain(
+        &mut self,
+        mut desc: DescriptorChain,
+        max_size: Option<u32>,
+    ) -> Result<(), IoVecError> {
+        self.clear();
+
+        loop {
             if !desc.is_write_only() {
                 return Err(IoVecError::ReadOnlyDescriptor);
             }
@@ -247,16 +276,34 @@ impl IoVecBufferMut {
             slice.bitmap().mark_dirty(0, desc.len as usize);
 
             let iov_base = slice.ptr_guard_mut().as_ptr().cast::<c_void>();
-            vecs.push(iovec {
+            self.vecs.push(iovec {
                 iov_base,
                 iov_len: desc.len as size_t,
             });
-            len = len
+            self.len = self
+                .len
                 .checked_add(desc.len)
                 .ok_or(IoVecError::OverflowedDescriptor)?;
+            if matches!(max_size, Some(max) if self.len >= max) {
+                break;
+            }
+            if desc.load_next_descriptor().is_none() {
+                break;
+            }
         }
 
-        Ok(Self { vecs, len })
+        Ok(())
+    }
+
+    /// Create an `IoVecBufferMut` from a `DescriptorChain`
+    /// # Safety
+    /// The descriptor chain cannot be referencing the same memory location as another chain.
+    pub unsafe fn from_descriptor_chain(head: DescriptorChain) -> Result<Self, IoVecError> {
+        let mut new_buffer = Self::default();
+
+        Self::load_descriptor_chain(&mut new_buffer, head, None)?;
+
+        Ok(new_buffer)
     }
 
     /// Get the total length of the memory regions covered by this `IoVecBuffer`
@@ -296,6 +343,22 @@ impl IoVecBufferMut {
             // We cannot write past the end of the `IoVecBufferMut`.
             Err(VolatileMemoryError::OutOfBounds { addr: offset })
         }
+    }
+
+    /// Returns a pointer to the memory keeping the `iovec` structs
+    pub fn as_iovec_ptr(&self) -> *const iovec {
+        self.vecs.as_ptr()
+    }
+
+    /// Returns the length of the `iovec` array.
+    pub fn iovec_count(&self) -> usize {
+        self.vecs.len()
+    }
+
+    /// Clears the `iovec` array
+    pub fn clear(&mut self) {
+        self.vecs.clear();
+        self.len = 0u32;
     }
 
     /// Writes up to `len` bytes into the `IoVecBuffer` starting at the given offset.
@@ -468,11 +531,13 @@ mod tests {
 
         let (mut q, _) = read_only_chain(&mem);
         let head = q.pop(&mem).unwrap();
-        IoVecBufferMut::from_descriptor_chain(head).unwrap_err();
+        // SAFETY: This descriptor chain is only loaded into one buffer.
+        unsafe { IoVecBufferMut::from_descriptor_chain(head).unwrap_err() };
 
         let (mut q, _) = write_only_chain(&mem);
         let head = q.pop(&mem).unwrap();
-        IoVecBufferMut::from_descriptor_chain(head).unwrap();
+        // SAFETY: This descriptor chain is only loaded into one buffer.
+        unsafe { IoVecBufferMut::from_descriptor_chain(head).unwrap() };
     }
 
     #[test]
@@ -493,7 +558,7 @@ mod tests {
         let head = q.pop(&mem).unwrap();
 
         // SAFETY: This descriptor chain is only loaded once in this test
-        let iovec = IoVecBufferMut::from_descriptor_chain(head).unwrap();
+        let iovec = unsafe { IoVecBufferMut::from_descriptor_chain(head).unwrap() };
         assert_eq!(iovec.len(), 4 * 64);
     }
 
@@ -558,7 +623,8 @@ mod tests {
         // This is a descriptor chain with 4 elements 64 bytes long each.
         let head = q.pop(&mem).unwrap();
 
-        let mut iovec = IoVecBufferMut::from_descriptor_chain(head).unwrap();
+        // SAFETY: This descriptor chain is only loaded into one buffer.
+        let mut iovec = unsafe { IoVecBufferMut::from_descriptor_chain(head).unwrap() };
         let buf = vec![0u8, 1, 2, 3, 4];
 
         // One test vector for each part of the chain
